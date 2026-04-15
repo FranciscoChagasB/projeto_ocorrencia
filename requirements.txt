@@ -6,3 +6,6 @@ scikit-learn
 pymongo
 requests
 py-eureka-client
+torch
+torchvision 
+torchaudio
