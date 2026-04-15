@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pandas
+h3
+scikit-learn
+pymongo
+requests
+py-eureka-client

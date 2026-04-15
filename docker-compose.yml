@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  motor-ia:
+    build: .
+    container_name: motor_ia_tatico
+    # O Portainer mapeia a porta aleatória externa para a 8080 interna
+    ports:
+      - "31420:8080" 
+    environment:
+      # As variáveis que montam o anúncio no Eureka:
+      - PUBLISH_IP=192.168.1.50   # O IP do Servidor do Portainer
+      - PORT=31420                # A porta externa que configurou acima
+      
+      # Ligando o Eureka
+      - USE_EUREKA=true
+      - EUREKA_URL=http://ip_do_seu_eureka:8761/eureka
+      
+      # Bancos e APIs
+      - MONGO_URI=mongodb://ip_do_seu_mongo:27017/
+      - API_CERCAS_URL=http://172.25.132.135:30066
+    restart: unless-stopped
