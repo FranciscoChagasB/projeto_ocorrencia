@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
 import py_eureka_client.eureka_client as eureka_client
+from sklearn.cluster import KMeans
 import requests
 import torch
 import pandas as pd
@@ -12,12 +13,13 @@ import math
 from pymongo import MongoClient
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import numpy as np
 import h3
 from pymongo import MongoClient
 from datetime import datetime, timedelta
 from motor_ia import MotorDiagnostico
+from collections import defaultdict
 
 from motor_ia import PrevisorOcorrencias, SistemaSugestaoTatica
 from analise_avancada import DetetorAnomalias, RastreadorClusters, PosicionamentoEstrategico
@@ -297,6 +299,18 @@ class OcorrenciaInput(BaseModel):
     longitude: float
     tipo: str
 
+def haversine_km(lat1, lon1, lat2, lon2):
+    R = 6371 # Raio da Terra em KM
+    dLat = math.radians(lat2 - lat1)
+    dLon = math.radians(lon2 - lon1)
+    a = math.sin(dLat/2) * math.sin(dLat/2) + \
+        math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * \
+        math.sin(dLon/2) * math.sin(dLon/2)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c
+
+
+
 def buscar_poligono_da_sua_api(ais_nome: str):
     """
     Substitua isso pela chamada real ao seu MongoDB/API.
@@ -454,108 +468,106 @@ def endpoint_mapa_calor_historico(ais: list[str] = Query(default=[])):
     return pontos_filtrados
 
 @app.get("/api/tatico/pontos-base")
-def endpoint_pontos_base(qtd_viaturas: int = 0, ais: list[str] = Query(default=[])):
-    # HORIZONTE FIXO TAMBÉM NAS VIATURAS
-    horizonte_horas = 6 
-    
-    if not ais:
-        return {"diretriz": "Selecione uma AIS", "frota": [], "minimo_sugerido": 0, "ideal_sugerido": 0}
+def gerar_rotas_patrulha(qtd_viaturas: int = 1, ais: list[str] = Query(default=[])):
+    try:
+        # Configurações de Filtro Tático
+        DISTANCIA_MAX_KM = 2.0  # Não conecta pontos a mais de 8km
+        DISTANCIA_MIN_KM = 0.3  # Ignora pontos a menos de 300m (muito perto)
+
+        pipeline = [
+            {"$group": {"_id": "$hex_id", "risco": {"$sum": "$score_risco_total"}}},
+            {"$sort": {"risco": -1}},
+            {"$limit": 100}
+        ]
+        top_hexes = list(db_global['features_historicas'].aggregate(pipeline))
         
-    df_sugestoes = sistema_tatico.gerar_malha_universal(
-        estado_atual_tensores, 
-        estado_atual_hex_ids, 
-        estado_atual_coberturas, 
-        lista_14d, lista_7d, lista_48h, lista_24h
-    )
-    
-    if df_sugestoes.empty:
-        return {"diretriz": "Aguardando dados dos sensores...", "frota": [], "minimo_sugerido": 0, "ideal_sugerido": 0}
-    
-    # MESMO FILTRO RIGOROSO PARA AS VIATURAS NÃO SAIREM DA AIS
-    poligonos_ativos = []
-    bbox_ativos = [] 
-    
-    for ais_nome in ais:
-        # A função nova já devolve tudo limpo
-        coords = buscar_poligono_da_sua_api(ais_nome)
+        coords = []
+        for h in top_hexes:
+            lat, lon = h3.cell_to_latlng(h['_id'])
+            coords.append({"lat": lat, "lon": lon, "risco": h['risco']})
+
+        if not coords: return {"frota": []}
+
+        n_clusters = min(max(1, qtd_viaturas), len(coords))
+        kmeans = KMeans(n_clusters=n_clusters, n_init=10).fit([[c['lat'], c['lon']] for c in coords])
         
-        # Se a AIS não existir ou o microserviço falhar, salta para a próxima
-        if not coords:
-            continue 
+        frota = []
+        for i in range(n_clusters):
+            pontos_zona = [c for idx, c in enumerate(coords) if kmeans.labels_[idx] == i]
             
-        poligonos_ativos.append(coords)
-        
-        lats = [p[0] for p in coords]
-        lons = [p[1] for p in coords]
-        bbox_ativos.append((min(lats), max(lats), min(lons), max(lons)))
-        
-    hex_ids_permitidos = set()
-    todos_hex_ids = df_sugestoes['hex_id'].tolist()
-    
-    for h_id in todos_hex_ids:
-        try:
-            lat, lon = h3.cell_to_latlng(h_id)
-        except AttributeError:
-            lat, lon = h3.h3_to_geo(h_id)
+            rota = []
+            # Inicia pelo ponto de maior risco daquela zona
+            atual = max(pontos_zona, key=lambda x: x['risco'])
+            pontos_zona.remove(atual)
+            rota.append([atual['lon'], atual['lat']]) # DeckGL usa [lng, lat]
             
-        for i, poli in enumerate(poligonos_ativos):
-            min_lat, max_lat, min_lon, max_lon = bbox_ativos[i]
-            if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
-                if ponto_dentro_poligono(lat, lon, poli):
-                    hex_ids_permitidos.add(h_id)
-                    break
+            while pontos_zona:
+                # Busca o vizinho mais próximo que respeite os limites de distância
+                candidatos = []
+                for p in pontos_zona:
+                    dist = haversine_km(atual['lat'], atual['lon'], p['lat'], p['lon'])
+                    if dist <= DISTANCIA_MAX_KM and dist >= DISTANCIA_MIN_KM:
+                        candidatos.append((p, dist))
+                
+                if not candidatos: break # Não há mais pontos seguros perto deste
+                
+                proximo, d = min(candidatos, key=lambda x: x[1])
+                pontos_zona.remove(proximo)
+                rota.append([proximo['lon'], proximo['lat']])
+                atual = proximo
+                
+            if len(rota) > 1: # Só cria rota se houver um caminho
+                frota.append({
+                    "viatura_id": f"PATRULHA-{i+1:02d}",
+                    "rota": rota,
+                    "cor_tática": [37, 99, 235]
+                })
 
-    # Corte geométrico final
-    df_filtrado = df_sugestoes[df_sugestoes['hex_id'].isin(hex_ids_permitidos)]
-    
-    if df_filtrado.empty:
-        return {"diretriz": "Sem dados na região da AIS.", "frota": [], "minimo_sugerido": 0, "ideal_sugerido": 0}
-    
-    # CÁLCULO DE DIMENSIONAMENTO DE FORÇA
-    area_por_vtr = 0.785 
-    area_total_ais = len(df_filtrado) * 0.105 
-
-    minimo = max(1, math.ceil(area_total_ais / area_por_vtr))
-    
-    # Para o roteamento, só focamos em áreas perigosas (Nível >= 2)
-    df_perigoso = df_filtrado[df_filtrado['nivel_prioridade'] >= 2]
-    
-    if df_perigoso.empty:
-        # Se estiver tudo verde, espalha uniformemente usando a malha toda
-        df_perigoso = df_filtrado
-
-    focos_vermelhos = df_perigoso[df_perigoso['nivel_prioridade'] >= 4]
-    reforco_risco = math.ceil(len(focos_vermelhos) / 5)
-    ideal = minimo + reforco_risco
-
-    viaturas_finais = ideal if qtd_viaturas <= 0 else qtd_viaturas
-
-    dados_totais = df_perigoso[['hex_id', 'vulnerabilidade_atual']].rename(columns={'vulnerabilidade_atual': 'score_vulnerabilidade'}).to_dict('records')
-    posicionamentos = motor_posicionamento.calcular_pontos_base(dados_totais, viaturas_finais)
-    
-    return {
-        "diretriz": f"Distribuindo {viaturas_finais} viaturas.",
-        "minimo_sugerido": minimo,
-        "ideal_sugerido": ideal,
-        "frota": posicionamentos
-    }
+        return {"frota": frota}
+    except Exception as e:
+        return {"erro": str(e), "frota": []}
 
 @app.get("/api/tatico/diagnostico-local/{hex_id}")
-def endpoint_diagnostico_local(hex_id: str):
-    """
-    Aciona o Random Forest para explicar o motivo do risco num hexágono específico.
-    """
-    # 1. Puxa a ficha criminal do local a partir dos dicionários que criamos na Inicialização
-    # É preciso garantir que as variáveis dict_14d, dict_7d, etc., estão acessíveis aqui.
-    cobertura = float(mapa_cobertura.get(hex_id, 0.0))
-    h24 = dict_24h.get(hex_id, 0.0)
-    h7 = dict_7d.get(hex_id, 0.0)
-    h14 = dict_14d.get(hex_id, 0.0)
-    
-    # 2. Interroga o Modelo Random Forest
-    relatorio = motor_diagnostico.explicar_local(cobertura, h24, h7, h14)
-    
-    return relatorio
+def diagnostico_local(hex_id: str):
+    try:
+        # Busca histórico para definir a "Assinatura do Crime"
+        cursor = db_global['ocorrencias_brutas'].find({"hex_id": hex_id})
+        crimes = list(cursor)
+        
+        if not crimes:
+            return {"tipologia_sugerida": "Área de Monitoramento", "ameacas_especificas": []}
+
+        contagem_tipos = defaultdict(list)
+        for c in crimes:
+            tipo = c.get('tipo_desc', 'OUTROS').upper()
+            dt = c.get('created_at')
+            # Extração de hora robusta
+            h = int(dt[11:13]) if isinstance(dt, str) else dt.hour
+            contagem_tipos[tipo].append(h)
+
+        ameacas = []
+        for tipo, horas in contagem_tipos.items():
+            perc = (len(horas) / len(crimes)) * 100
+            if perc > 10: # Filtra crimes relevantes
+                # Heurística de Faixa de Horário
+                hora_pico = max(set(horas), key=horas.count)
+                inicio, fim = (hora_pico - 2) % 24, (hora_pico + 2) % 24
+                faixa = f"{inicio:02d}:00 - {fim:02d}:00"
+                
+                ameacas.append({
+                    "crime": tipo,
+                    "vulnerabilidade": round(perc, 1),
+                    "faixa_horario": faixa,
+                    "qtd": len(horas)
+                })
+
+        ameacas = sorted(ameacas, key=lambda x: x['vulnerabilidade'], reverse=True)
+        return {
+            "tipologia_sugerida": f"Foco: {ameacas[0]['crime']}" if ameacas else "Risco Geral",
+            "ameacas_especificas": ameacas
+        }
+    except Exception as e:
+        return {"erro": str(e)}
 
 @app.get("/api/tatico/cerca/{ais_nome}")
 def obter_cerca_virtual(ais_nome: str):
@@ -592,7 +604,7 @@ def listar_ocorrencias_local(hex_id: str):
             ]
         }
         
-        cursor = db['ocorrencias_brutas'].find(
+        cursor = db_global['ocorrencias_brutas'].find(
             query, 
             {"_id": 1, "tipo_desc": 1, "created_at": 1}
         ).sort("created_at", -1).limit(50)
