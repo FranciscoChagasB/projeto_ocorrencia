@@ -22,7 +22,7 @@ from motor_ia import MotorDiagnostico
 from motor_ia import PrevisorOcorrencias, SistemaSugestaoTatica
 from analise_avancada import DetetorAnomalias, RastreadorClusters, PosicionamentoEstrategico
 
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "ocorrencia_tatico")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "ocorrencia_tatica")
 PORTA_API_INTERNA = 8080
 NOME_APLICACAO = "motor-ia-tatico"
 PUBLISH_IP = os.getenv("PUBLISH_IP", "127.0.0.1")
@@ -217,6 +217,12 @@ except Exception as e:
 print("3. Fatiando o tempo e mapeando a cidade...")
 
 agora = datetime.now()
+limite_tempo = datetime.now() - timedelta(days=14)
+cursor = db_global.features_historicas.find({"janela_tempo": {"$gte": limite_tempo}}, {"_id": 0})
+lista_dados = list(cursor)
+if len(lista_dados) == 0:
+        raise ValueError("Banco de dados vazio!")
+df_real = pd.DataFrame(lista_dados)
 df_24h = df_real[df_real['janela_tempo'] >= (agora - timedelta(hours=24))]
 df_48h = df_real[df_real['janela_tempo'] >= (agora - timedelta(hours=48))]
 df_7d  = df_real[df_real['janela_tempo'] >= (agora - timedelta(days=7))]
@@ -449,7 +455,7 @@ def endpoint_mapa_calor_historico(ais: list[str] = Query(default=[])):
 
 @app.get("/api/tatico/pontos-base")
 def endpoint_pontos_base(qtd_viaturas: int = 0, ais: list[str] = Query(default=[])):
-    # 2. HORIZONTE FIXO TAMBÉM NAS VIATURAS
+    # HORIZONTE FIXO TAMBÉM NAS VIATURAS
     horizonte_horas = 6 
     
     if not ais:
@@ -534,28 +540,13 @@ def endpoint_pontos_base(qtd_viaturas: int = 0, ais: list[str] = Query(default=[
         "frota": posicionamentos
     }
 
-
-"""@app.post("/api/tatico/manchas-criminais")
-def endpoint_manchas_criminais(ocorrencias: List[OcorrenciaInput]):
-    if len(ocorrencias) < 3:
-        return {"status": "tranquilo", "crimes_em_serie_detectados": []}
-        
-    # Converte o payload JSON para DataFrame
-    df_recentes = pd.DataFrame([o.model_dump() for o in ocorrencias])
-    manchas = motor_clusters.rastrear_manchas(df_recentes)
-    
-    return {
-        "status": "alerta" if len(manchas) > 0 else "tranquilo",
-        "crimes_em_serie_detectados": manchas
-    }"""
-
 @app.get("/api/tatico/diagnostico-local/{hex_id}")
 def endpoint_diagnostico_local(hex_id: str):
     """
     Aciona o Random Forest para explicar o motivo do risco num hexágono específico.
     """
     # 1. Puxa a ficha criminal do local a partir dos dicionários que criamos na Inicialização
-    # Nota: Precisamos de garantir que as variáveis dict_14d, dict_7d, etc., estão acessíveis aqui.
+    # É preciso garantir que as variáveis dict_14d, dict_7d, etc., estão acessíveis aqui.
     cobertura = float(mapa_cobertura.get(hex_id, 0.0))
     h24 = dict_24h.get(hex_id, 0.0)
     h7 = dict_7d.get(hex_id, 0.0)
@@ -566,13 +557,73 @@ def endpoint_diagnostico_local(hex_id: str):
     
     return relatorio
 
+@app.get("/api/tatico/cerca/{ais_nome}")
+def obter_cerca_virtual(ais_nome: str):
+    """
+    Proxy de CORS: O Frontend pede ao Python, o Python pede ao Microsserviço Java.
+    """
+    try:
+        # Usa a variável de ambiente que já configurámos para o Docker
+        url = f"{MICROSERVICO_CERCAS}/rotas/cerca/geometria/system?nome={ais_nome}"
+        resposta = requests.get(url, timeout=5)
+        
+        if resposta.status_code == 200:
+            return resposta.json()
+        return {"geom": {"points": []}}
+    except Exception as e:
+        print(f"Erro de comunicação com o serviço de cercas Java: {e}")
+        return {"geom": {"points": []}}
+
+def listar_ocorrencias_local(hex_id: str):
+    """
+    Retorna a lista de crimes (Lida com Datas em formato String ou ISODate)
+    """
+    try:
+        limite_dt = datetime.now(timezone.utc) - timedelta(days=14)
+        # Cria uma versão em texto da data limite para apanhar os dados antigos
+        limite_str = limite_dt.strftime("%Y-%m-%d") 
+        
+        # O $or faz o Mongo procurar nos dois formatos!
+        query = {
+            "hex_id": hex_id,
+            "$or": [
+                {"created_at": {"$gte": limite_dt}},
+                {"created_at": {"$gte": limite_str}}
+            ]
+        }
+        
+        cursor = db['ocorrencias_brutas'].find(
+            query, 
+            {"_id": 1, "tipo_desc": 1, "created_at": 1}
+        ).sort("created_at", -1).limit(50)
+        
+        lista = []
+        for doc in cursor:
+            data_raw = doc.get("created_at")
+            
+            # Formata elegantemente quer seja Texto quer seja Data
+            if isinstance(data_raw, str):
+                # Se for "2026-04-12 01:30:30.312", corta para ficar só Dia e Hora
+                data_formatada = data_raw[8:10] + "/" + data_raw[5:7] + " " + data_raw[11:16]
+            else:
+                data_formatada = data_raw.strftime("%d/%m %H:%M")
+                
+            lista.append({
+                "id": str(doc["_id"]),
+                "tipo": doc.get("tipo_desc", "Desconhecido"),
+                "data": data_formatada
+            })
+        return lista
+    except Exception as e:
+        print(f"Erro ao listar ocorrências: {e}")
+        return []
+
 @app.get("/api/tatico/alerta-anomalia")
 def endpoint_alerta_anomalia():
     """ 
     Devolve o status atual da cidade calculado em background pelo Alimentador.
     Resposta instantânea (O(1)) e formatada para a UI.
     """
-    # Usamos o cliente mongo global que já criamos
     db = cliente_mongo["ocorrencia_tatico"]
     
     status = db.status_sistema.find_one({"tipo_status": "sensor_anomalia"}, {"_id": 0})
@@ -588,7 +639,7 @@ def endpoint_alerta_anomalia():
             "ultima_atualizacao": "N/A"
         }
 
-    # Formatamos a hora para o frontend mostrar "Última Checagem: 14:05"
+    # Formatar a hora para o frontend mostrar "Última Checagem: 14:05"
     ultima_att = status["timestamp"].strftime("%H:%M")
 
     return {

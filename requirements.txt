@@ -9,3 +9,6 @@ py-eureka-client
 torch
 torchvision 
 torchaudio
+openpyxl
+numpy
+scipy
