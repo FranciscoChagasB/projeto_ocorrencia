@@ -20,6 +20,9 @@ from pymongo import MongoClient
 from datetime import datetime, timedelta
 from motor_ia import MotorDiagnostico
 from collections import defaultdict
+from pydantic import BaseModel
+from typing import List, Optional
+import itertools
 
 from motor_ia import PrevisorOcorrencias, SistemaSugestaoTatica
 from analise_avancada import DetetorAnomalias, RastreadorClusters, PosicionamentoEstrategico
@@ -35,16 +38,13 @@ MICROSERVICO_CERCAS = os.getenv("API_CERCAS_URL", "http://172.25.132.135:30066")
 
 print("Conectando ao MongoDB...")
 try:
-    # Conexão Global: Criada uma única vez ao subir o servidor
     cliente_mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
     db_global = cliente_mongo[MONGO_DB_NAME]
-    # Testa a conexão rapidinho
     cliente_mongo.server_info()
 except Exception as e:
     print(f"FATAL: Falha ao conectar no MongoDB ({MONGO_URI}): {e}")
 
-"""CRIA UMA ROTINA PARA PEGAR TODAS OCORRENCIAS DA ULTIMA HORA E INSERI-LAS 
-NO BANCO COM DADOS MASTIGADOS PARA ALIMENTAR O MODELO TREINADO"""
+    
 def rotina_alimentador():
     try:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Iniciando Alimentador IA (Modo Denso/Zero-Padding)...")
@@ -52,10 +52,8 @@ def rotina_alimentador():
         agora = datetime.now()
         inicio_janela = agora - timedelta(hours=1)
         
-        # 1. Pega todos os hexágonos que a polícia já monitora (Lista Mestra)
         todos_hex_ids = db_global.features_historicas.distinct("hex_id")
         
-        # 2. Busca crimes da última hora
         crimes = list(db_global.ocorrencias_brutas.find({
             "data_hora": {"$gte": inicio_janela, "$lt": agora}
         }))
@@ -66,10 +64,8 @@ def rotina_alimentador():
         if volume_total_cidade > 0:
             df = pd.DataFrame(crimes)
             df['hex_id'] = df.apply(lambda x: h3.latlng_to_cell(x['latitude'], x['longitude'], 9), axis=1)
-            # Transforma a contagem num dicionário { "hex_id": qtd_crimes }
             contagem_crimes = df.groupby('hex_id').size().to_dict()
             
-            # Se um crime aconteceu num lugar inédito, adiciona à lista mestra
             for hex_novo in contagem_crimes.keys():
                 if hex_novo not in todos_hex_ids:
                     todos_hex_ids.append(hex_novo)
@@ -78,21 +74,18 @@ def rotina_alimentador():
         hora = agora.hour
         dia = agora.weekday()
         
-        # Matemática de tempo calculada apenas 1 vez por janela para poupar CPU
         hora_sin = float(np.sin(2 * np.pi * hora / 24))
         hora_cos = float(np.cos(2 * np.pi * hora / 24))
         dia_sin = float(np.sin(2 * np.pi * dia / 7))
         dia_cos = float(np.cos(2 * np.pi * dia / 7))
 
-        # 3. A MÁGICA DO ZERO-PADDING (Gera registo para a cidade inteira)
         for hex_id in todos_hex_ids:
-            # Tenta pegar a quantidade de crimes. Se não achar, preenche com 0.0!
             score_risco = float(contagem_crimes.get(hex_id, 0.0))
             
             novos_registros.append({
                 "hex_id": hex_id,
                 "janela_tempo": agora,
-                "score_risco_total": score_risco, # AQUI ENTRA O ZERO QUANDO HÁ PAZ
+                "score_risco_total": score_risco,
                 "hora_sin": hora_sin,
                 "hora_cos": hora_cos,
                 "dia_sin": dia_sin,
@@ -104,7 +97,6 @@ def rotina_alimentador():
             db_global.features_historicas.insert_many(novos_registros)
             print(f"{len(novos_registros)} registos da malha atualizados. (Crimes: {volume_total_cidade})")
 
-        # Deteta anomalia
         is_anomalo = motor_anomalias.detetar(hora, dia, volume_total_cidade)
         _salvar_status_anomalia(db_global, agora, hora, dia, volume_total_cidade, bool(is_anomalo))
             
@@ -135,13 +127,11 @@ def _salvar_status_anomalia(db, timestamp, hora, dia, volume, is_anomalo):
         upsert=True
     )
 
-# LOOP INFINITO DO ALIMENTADOR
 async def loop_alimentador():
     while True:
         await asyncio.to_thread(rotina_alimentador)
         await asyncio.sleep(3600)
 
-# CICLO DE VIDA DA API
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print(f"Iniciando {NOME_APLICACAO} internamente na porta {PORTA_API_INTERNA}...")
@@ -157,13 +147,12 @@ async def lifespan(app: FastAPI):
             instance_port=PORTA_EXTERNA    
         )
     
-    yield # A API fica a rodar aqui
+    yield
     
     if os.getenv("USE_EUREKA", "false").lower() == "true":
         print("Desconectando do Eureka...")
         await eureka_client.stop_async()
 
-# INSTANCIAÇÃO DA API COM LIFESPAN
 app = FastAPI(title="API de gerenciamento inteligente de ocorrências", lifespan=lifespan)
 
 app.add_middleware(
@@ -177,7 +166,6 @@ app.add_middleware(
 print("1. Inicializando Motores de Inteligência...")
 diretorio_base = os.path.dirname(os.path.abspath(__file__))
 
-# 2. CARREGAMENTO DOS DADOS REAIS E CÂMERAS
 print("2. Carregando memória dos últimos 7 dias e Infraestrutura...")
 diretorio_base = os.path.dirname(os.path.abspath(__file__))
 caminho_csv = os.path.join(diretorio_base, "dados", "features_treinamento.csv")
@@ -188,10 +176,8 @@ try:
     df_cameras = pd.read_excel(caminho_cameras)
     for _, row in df_cameras.iterrows():
         try:
-            # Tenta sintaxe H3 nova (v4)
             h_id = h3.latlng_to_cell(row['latitude'], row['longitude'], 9)
         except AttributeError:
-            # Fallback para sintaxe H3 antiga (v3)
             h_id = h3.geo_to_h3(row['latitude'], row['longitude'], 9)
             
         mapa_cobertura[h_id] = mapa_cobertura.get(h_id, 0) + 1
@@ -213,9 +199,6 @@ try:
 except Exception as e:
     print(f"Usando backup offline. Motivo: {e}")
 
-# ==========================================
-# 3. PREPARAÇÃO DO ESTADO ATUAL (FUSÃO TÁTICA 4 CAMADAS)
-# ==========================================
 print("3. Fatiando o tempo e mapeando a cidade...")
 
 agora = datetime.now()
@@ -229,7 +212,6 @@ df_24h = df_real[df_real['janela_tempo'] >= (agora - timedelta(hours=24))]
 df_48h = df_real[df_real['janela_tempo'] >= (agora - timedelta(hours=48))]
 df_7d  = df_real[df_real['janela_tempo'] >= (agora - timedelta(days=7))]
 
-# Agrega a soma de crimes (score_risco_total) por hexágono
 dict_14d = df_real.groupby('hex_id')['score_risco_total'].sum().to_dict()
 dict_7d  = df_7d.groupby('hex_id')['score_risco_total'].sum().to_dict()
 dict_48h = df_48h.groupby('hex_id')['score_risco_total'].sum().to_dict()
@@ -255,10 +237,8 @@ for hex_id, dados_hex in df_real.groupby('hex_id'):
     estado_atual_tensores.append(torch.FloatTensor(ultimas_janelas))
     estado_atual_hex_ids.append(hex_id)
     
-    # Cobertura real vinda do excel (mapa_cobertura) que você já tem no api.py
     estado_atual_coberturas.append(float(mapa_cobertura.get(hex_id, 0.0)))
     
-    # Estatísticas fatiadas
     lista_14d.append(dict_14d.get(hex_id, 0.0))
     lista_7d.append(dict_7d.get(hex_id, 0.0))
     lista_48h.append(dict_48h.get(hex_id, 0.0))
@@ -266,7 +246,6 @@ for hex_id, dados_hex in df_real.groupby('hex_id'):
 
 print(f"{len(estado_atual_hex_ids)} hexágonos embalados para a I.A.")
 
-# 4. INSTANCIAÇÃO DOS MOTORES (CÉREBROS)
 print("4. Acordando as Inteligências Artificiais...")
 caminho_modelo = os.path.join(diretorio_base, "modelo_tatico_lstm.pth")
 modelo_lstm = PrevisorOcorrencias(input_size=6)
@@ -292,30 +271,49 @@ motor_posicionamento = PosicionamentoEstrategico()
 
 print("API online e aguardando comandos.")
 
-# MODELOS DE ENTRADA (PYDANTIC)
 class OcorrenciaInput(BaseModel):
     id: str
     latitude: float
     longitude: float
     tipo: str
 
+class ViaturaConfig(BaseModel):
+    id_manual: str
+    tipo_crime_foco: str 
+    ais_alocada: str 
+
+class RequisicaoPatrulha(BaseModel):
+    viaturas: List[ViaturaConfig]
+    distancia_max_km: Optional[float] = 2.0
+
 def haversine_km(lat1, lon1, lat2, lon2):
-    R = 6371 # Raio da Terra em KM
-    dLat = math.radians(lat2 - lat1)
-    dLon = math.radians(lon2 - lon1)
-    a = math.sin(dLat/2) * math.sin(dLat/2) + \
-        math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * \
-        math.sin(dLon/2) * math.sin(dLon/2)
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    return R * c
+    R = 6371
+    dLat, dLon = math.radians(lat2-lat1), math.radians(lon2-lon1)
+    a = math.sin(dLat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dLon/2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
-
+def otimizar_rota_tsp(pontos):
+    if len(pontos) <= 2:
+        return pontos, sum(haversine_km(pontos[i]['lat'], pontos[i]['lon'], pontos[i+1]['lat'], pontos[i+1]['lon']) for i in range(len(pontos)-1))
+    
+    if len(pontos) <= 7:
+        menor_distancia = float('inf')
+        melhor_rota = None
+        
+        for permutacao in itertools.permutations(pontos):
+            dist = 0
+            for i in range(len(permutacao) - 1):
+                dist += haversine_km(permutacao[i]['lat'], permutacao[i]['lon'], permutacao[i+1]['lat'], permutacao[i+1]['lon'])
+            
+            if dist < menor_distancia:
+                menor_distancia = dist
+                melhor_rota = list(permutacao)
+                
+        return melhor_rota, menor_distancia
+    else:
+        return pontos, 0 # Fallback
 
 def buscar_poligono_da_sua_api(ais_nome: str):
-    """
-    Substitua isso pela chamada real ao seu MongoDB/API.
-    Deve retornar um dicionário no formato GeoJSON padrão.
-    """
 
     url = f"http://172.25.132.135:30066/rotas/cerca/geometria/system?nome={ais_nome}"
 
@@ -324,10 +322,8 @@ def buscar_poligono_da_sua_api(ais_nome: str):
         if resposta.status_code == 200:
             dados = resposta.json()
             
-            # Navega pelo novo JSON: geom -> points
             pontos = dados.get("geom", {}).get("points", [])
             
-            # Extrai [y, x] que equivale a [latitude, longitude]
             coords = [[p["y"], p["x"]] for p in pontos]
             return coords
             
@@ -356,71 +352,129 @@ def ponto_dentro_poligono(lat, lon, poligono):
     return inside
 
 # ENDPOINTS DA API
-
 @app.get("/")
 def health_check():
     return {"status": "online", "motores_ativos": 4, "hexagonos_monitorados": len(estado_atual_hex_ids)}
 
 @app.get("/api/tatico/sugestoes-cameras")
-def endpoint_sugestoes_cameras(ais: list[str] = Query(default=[])):
-    # 1. HORIZONTE FIXO: O frontend já não manda isto. O turno tático é de 6 horas.
-    horizonte_horas = 6 
-    
+def obter_malha_tatica(ais: list[str] = Query(default=[])):
     if not ais:
-        return [] 
-        
-    df_sugestoes = sistema_tatico.gerar_malha_universal(
-        estado_atual_tensores, 
-        estado_atual_hex_ids, 
-        estado_atual_coberturas, 
-        lista_14d, lista_7d, lista_48h, lista_24h
-    )
-    
-    if df_sugestoes.empty:
         return []
 
-    poligonos_ativos = []
-    bbox_ativos = []
-    
-    for ais_nome in ais:
-        # A função nova já devolve tudo limpo
-        coords = buscar_poligono_da_sua_api(ais_nome)
-        
-        # Se a AIS não existir ou o microserviço falhar, salta para a próxima
-        if not coords:
-            continue 
-            
-        poligonos_ativos.append(coords)
-        
-        lats = [p[0] for p in coords]
-        lons = [p[1] for p in coords]
-        bbox_ativos.append((min(lats), max(lats), min(lons), max(lons)))
-        
-    hex_ids_permitidos = set()
-    todos_hex_ids = df_sugestoes['hex_id'].tolist()
-    
-    for h_id in todos_hex_ids:
-        try:
-            lat, lon = h3.cell_to_latlng(h_id)
-        except AttributeError:
-            lat, lon = h3.h3_to_geo(h_id)
-            
-        for i, poli in enumerate(poligonos_ativos):
-            min_lat, max_lat, min_lon, max_lon = bbox_ativos[i]
-            if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
-                if ponto_dentro_poligono(lat, lon, poli):
-                    hex_ids_permitidos.add(h_id)
-                    break 
+    try:
+        # 1. Obter Polígonos das AIS Selecionadas
+        poligonos_ativos = []
+        bbox_ativos = []
+        for ais_nome in ais:
+            coords = buscar_poligono_da_sua_api(ais_nome)
+            if coords:
+                poligonos_ativos.append(coords)
+                lats = [p[0] for p in coords]
+                lons = [p[1] for p in coords]
+                bbox_ativos.append((min(lats), max(lats), min(lons), max(lons)))
+                
+        if not poligonos_ativos:
+            return []
 
-    df_filtrado = df_sugestoes[df_sugestoes['hex_id'].isin(hex_ids_permitidos)]
-    return df_filtrado.to_dict(orient="records")
+        # 2. Puxar Dados Históricos Dinâmicos do Mongo
+        # Vamos usar o relógio real para fatiar o histórico recente
+        agora = datetime.now(timezone.utc)
+        d24h = agora - timedelta(days=1)
+        d48h = agora - timedelta(days=2)
+        d7d = agora - timedelta(days=7)
+        d14d = agora - timedelta(days=14)
+
+        pipeline = [
+            {"$group": {
+                "_id": "$hex_id", 
+                "peso_historico": {"$sum": "$score_risco_total"},
+                # Se a janela de tempo do crime for maior que ontem, soma o risco em hist_24h, senão soma 0
+                "hist_24h": {"$sum": {"$cond": [{"$gte": ["$janela_tempo", d24h]}, "$score_risco_total", 0]}},
+                "hist_48h": {"$sum": {"$cond": [{"$gte": ["$janela_tempo", d48h]}, "$score_risco_total", 0]}},
+                "hist_7d":  {"$sum": {"$cond": [{"$gte": ["$janela_tempo", d7d]}, "$score_risco_total", 0]}},
+                "hist_14d": {"$sum": {"$cond": [{"$gte": ["$janela_tempo", d14d]}, "$score_risco_total", 0]}}
+            }}
+        ]
+        
+        locais = list(db_global['features_historicas'].aggregate(pipeline))
+        
+        # 3. Correção do Outlier (O fim do "Mapa Tudo Verde")
+        # Em vez de pegar no valor absoluto máximo, pegamos no topo dos 5% piores locais (Percentil 95)
+        pesos_ordenados = sorted([loc['peso_historico'] for loc in locais])
+        if not pesos_ordenados:
+            return []
+            
+        indice_p95 = int(len(pesos_ordenados) * 0.95)
+        teto_peso = pesos_ordenados[indice_p95] if indice_p95 < len(pesos_ordenados) and pesos_ordenados[indice_p95] > 0 else 1
+        
+        hora_atual = agora.hour
+        malha_resposta = []
+        
+        # 4. Cruzamento Geográfico e Cálculo Final
+        for loc in locais:
+            h_id = loc['_id']
+            
+            # Filtro de AIS (Ponto dentro do Polígono)
+            try:
+                lat, lon = h3.cell_to_latlng(h_id)
+            except AttributeError:
+                lat, lon = h3.h3_to_geo(h_id)
+                
+            dentro_da_ais = False
+            for i, poli in enumerate(poligonos_ativos):
+                min_lat, max_lat, min_lon, max_lon = bbox_ativos[i]
+                # Passa pelo BBox primeiro (rápido), e se bater, passa pelo Ray Casting (preciso)
+                if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
+                    if ponto_dentro_poligono(lat, lon, poli):
+                        dentro_da_ais = True
+                        break
+            
+            if not dentro_da_ais:
+                continue
+
+            # A MÁGICA DOS CÁLCULOS
+            peso = loc['peso_historico']
+            
+            # Vulnerabilidade (Estática, baseada no Teto P95)
+            vulnerabilidade = (peso / teto_peso) * 100
+            vulnerabilidade = min(99.9, max(1.0, vulnerabilidade))
+            
+            # Risco Atual (Dinâmico) - A I.A. suavizada para não desligar o mapa de manhã
+            # O modificador agora flutua entre 0.4 e 1.0 (nunca zera)
+            modificador_hora = (math.sin(math.pi * (hora_atual - 6) / 12) * 0.3) + 0.7 
+            
+            # Bónus Tático: Se a rua teve crime nas últimas 24h, a I.A. dispara o Risco Atual
+            pico_recente = 1.25 if loc['hist_24h'] > 0 else 1.0
+            
+            risco = vulnerabilidade * modificador_hora * pico_recente
+            risco = min(99.9, max(1.0, risco))
+
+            malha_resposta.append({
+                "hex_id": h_id,
+                "peso_cobertura": 0.0,
+                
+                # Nível de Prioridade alinhado com a cor do Frontend
+                "nivel_prioridade": 5 if risco > 70 else (4 if risco > 50 else (3 if risco > 30 else (2 if risco > 15 else 1))),
+                
+                "vulnerabilidade_atual": round(vulnerabilidade, 1),
+                "risco_atual": round(risco, 1),
+                "vulnerabilidade_1w": round(vulnerabilidade, 1),
+                "risco_1w": round((risco + vulnerabilidade) / 2, 1),
+                
+                # Histórico Bruto Real (Consultado no Banco)
+                "hist_24h": round(loc['hist_24h'], 1),
+                "hist_48h": round(loc['hist_48h'], 1),
+                "hist_7d": round(loc['hist_7d'], 1),
+                "hist_14d": round(loc['hist_14d'], 1)
+            })
+            
+        return malha_resposta
+    except Exception as e:
+        print("Erro na malha tática:", e)
+        return []
 
 @app.get("/api/tatico/mapa-calor-historico")
 def endpoint_mapa_calor_historico(ais: list[str] = Query(default=[])):
-    """ 
-    Ignora a I.A. completamente. Devolve apenas as coordenadas brutas 
-    das ocorrências reais para o Frontend renderizar um Heatmap de densidade.
-    """
     if not ais:
         return []
 
@@ -428,10 +482,8 @@ def endpoint_mapa_calor_historico(ais: list[str] = Query(default=[])):
     bbox_ativos = []
     
     for ais_nome in ais:
-        # A função nova já devolve tudo limpo
         coords = buscar_poligono_da_sua_api(ais_nome)
         
-        # Se a AIS não existir ou o microserviço falhar, salta para a próxima
         if not coords:
             continue 
             
@@ -441,7 +493,6 @@ def endpoint_mapa_calor_historico(ais: list[str] = Query(default=[])):
         lons = [p[1] for p in coords]
         bbox_ativos.append((min(lats), max(lats), min(lons), max(lons)))
 
-    # Extrai as coordenadas brutas diretamente da coleção original
     ocorrencias_brutas = list(db_global.ocorrencias_brutas.find({}, {"latitude": 1, "longitude": 1, "_id": 0}))
     
     pontos_filtrados = []
@@ -453,7 +504,6 @@ def endpoint_mapa_calor_historico(ais: list[str] = Query(default=[])):
         if lat is None or lon is None: 
             continue
             
-        # Filtro Rigoroso para manter os pontos apenas dentro da AIS
         dentro_da_ais = False
         for i, poli in enumerate(poligonos_ativos):
             min_lat, max_lat, min_lon, max_lon = bbox_ativos[i]
@@ -467,70 +517,94 @@ def endpoint_mapa_calor_historico(ais: list[str] = Query(default=[])):
 
     return pontos_filtrados
 
-@app.get("/api/tatico/pontos-base")
-def gerar_rotas_patrulha(qtd_viaturas: int = 1, ais: list[str] = Query(default=[])):
+@app.post("/api/tatico/pontos-base")
+async def gerar_rotas_patrulha(req: RequisicaoPatrulha):
     try:
-        # Configurações de Filtro Tático
-        DISTANCIA_MAX_KM = 2.0  # Não conecta pontos a mais de 8km
-        DISTANCIA_MIN_KM = 0.3  # Ignora pontos a menos de 300m (muito perto)
+        frota_final = []
+        DISTANCIA_MIN_KM = 0.0 
+        LIMITE_PONTOS_POR_ROTA = 6
 
-        pipeline = [
-            {"$group": {"_id": "$hex_id", "risco": {"$sum": "$score_risco_total"}}},
-            {"$sort": {"risco": -1}},
-            {"$limit": 100}
-        ]
-        top_hexes = list(db_global['features_historicas'].aggregate(pipeline))
-        
-        coords = []
-        for h in top_hexes:
-            lat, lon = h3.cell_to_latlng(h['_id'])
-            coords.append({"lat": lat, "lon": lon, "risco": h['risco']})
-
-        if not coords: return {"frota": []}
-
-        n_clusters = min(max(1, qtd_viaturas), len(coords))
-        kmeans = KMeans(n_clusters=n_clusters, n_init=10).fit([[c['lat'], c['lon']] for c in coords])
-        
-        frota = []
-        for i in range(n_clusters):
-            pontos_zona = [c for idx, c in enumerate(coords) if kmeans.labels_[idx] == i]
+        for v in req.viaturas:
+            poligono_ais = buscar_poligono_da_sua_api(v.ais_alocada)
+            if not poligono_ais:
+                continue
             
-            rota = []
-            # Inicia pelo ponto de maior risco daquela zona
-            atual = max(pontos_zona, key=lambda x: x['risco'])
-            pontos_zona.remove(atual)
-            rota.append([atual['lon'], atual['lat']]) # DeckGL usa [lng, lat]
+            foco = v.tipo_crime_foco.upper()
             
-            while pontos_zona:
-                # Busca o vizinho mais próximo que respeite os limites de distância
-                candidatos = []
-                for p in pontos_zona:
-                    dist = haversine_km(atual['lat'], atual['lon'], p['lat'], p['lon'])
-                    if dist <= DISTANCIA_MAX_KM and dist >= DISTANCIA_MIN_KM:
-                        candidatos.append((p, dist))
+            pipeline = [
+                {
+                    "$match": {
+                        "$or": [
+                            {"tipo_desc": {"$regex": foco, "$options": "i"}},
+                            {"tipo": {"$regex": foco, "$options": "i"}}
+                        ]
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": "$hex_id",
+                        "peso": {"$sum": 1},
+                        "lat": {"$first": "$latitude"},
+                        "lon": {"$first": "$longitude"}
+                    }
+                },
+                {"$sort": {"peso": -1}}
+            ]
+            
+            candidatos = list(db_global['ocorrencias_brutas'].aggregate(pipeline))
+            
+            pontos_validos = []
+            for c in candidatos:
+                lat, lon = c['lat'], c['lon']
+                if ponto_dentro_poligono(lat, lon, poligono_ais):
+                    pontos_validos.append({
+                        "lat": lat, "lon": lon, "peso": c['peso']
+                    })
+
+            if not pontos_validos:
+                continue
+
+            pontos_selecionados = []
+            atual = max(pontos_validos, key=lambda x: x['peso'])
+            pontos_validos.remove(atual)
+            pontos_selecionados.append(atual)
+
+            while pontos_validos and len(pontos_selecionados) < LIMITE_PONTOS_POR_ROTA:
+                vizinhos = []
+                for p in pontos_validos:
+                    d = haversine_km(atual['lat'], atual['lon'], p['lat'], p['lon'])
+                    if d <= req.distancia_max_km and d > DISTANCIA_MIN_KM:
+                        vizinhos.append((p, d))
                 
-                if not candidatos: break # Não há mais pontos seguros perto deste
+                if not vizinhos: break 
                 
-                proximo, d = min(candidatos, key=lambda x: x[1])
-                pontos_zona.remove(proximo)
-                rota.append([proximo['lon'], proximo['lat']])
+                proximo, dist_segmento = min(vizinhos, key=lambda x: x[1])
+                pontos_validos.remove(proximo)
+                pontos_selecionados.append(proximo)
                 atual = proximo
-                
-            if len(rota) > 1: # Só cria rota se houver um caminho
-                frota.append({
-                    "viatura_id": f"PATRULHA-{i+1:02d}",
-                    "rota": rota,
-                    "cor_tática": [37, 99, 235]
-                })
 
-        return {"frota": frota}
+            melhor_ordem, distancia_total = otimizar_rota_tsp(pontos_selecionados)
+            
+            rota_formatada = [[p['lon'], p['lat']] for p in melhor_ordem]
+
+            frota_final.append({
+                "viatura_id": v.id_manual,
+                "foco_especializado": foco,
+                "ais": v.ais_alocada,
+                "rota": rota_formatada,
+                "qtd_pontos": len(rota_formatada),
+                "distancia_total_km": round(distancia_total, 2)
+            })
+
+        return {"frota": frota_final}
+        
     except Exception as e:
+        print("Erro nas rotas:", e)
         return {"erro": str(e), "frota": []}
 
 @app.get("/api/tatico/diagnostico-local/{hex_id}")
 def diagnostico_local(hex_id: str):
     try:
-        # Busca histórico para definir a "Assinatura do Crime"
         cursor = db_global['ocorrencias_brutas'].find({"hex_id": hex_id})
         crimes = list(cursor)
         
@@ -541,7 +615,6 @@ def diagnostico_local(hex_id: str):
         for c in crimes:
             tipo = c.get('tipo_desc', 'OUTROS').upper()
             dt = c.get('created_at')
-            # Extração de hora robusta
             h = int(dt[11:13]) if isinstance(dt, str) else dt.hour
             contagem_tipos[tipo].append(h)
 
@@ -549,7 +622,6 @@ def diagnostico_local(hex_id: str):
         for tipo, horas in contagem_tipos.items():
             perc = (len(horas) / len(crimes)) * 100
             if perc > 10: # Filtra crimes relevantes
-                # Heurística de Faixa de Horário
                 hora_pico = max(set(horas), key=horas.count)
                 inicio, fim = (hora_pico - 2) % 24, (hora_pico + 2) % 24
                 faixa = f"{inicio:02d}:00 - {fim:02d}:00"
@@ -571,11 +643,7 @@ def diagnostico_local(hex_id: str):
 
 @app.get("/api/tatico/cerca/{ais_nome}")
 def obter_cerca_virtual(ais_nome: str):
-    """
-    Proxy de CORS: O Frontend pede ao Python, o Python pede ao Microsserviço Java.
-    """
     try:
-        # Usa a variável de ambiente que já configurámos para o Docker
         url = f"{MICROSERVICO_CERCAS}/rotas/cerca/geometria/system?nome={ais_nome}"
         resposta = requests.get(url, timeout=5)
         
@@ -587,15 +655,10 @@ def obter_cerca_virtual(ais_nome: str):
         return {"geom": {"points": []}}
 
 def listar_ocorrencias_local(hex_id: str):
-    """
-    Retorna a lista de crimes (Lida com Datas em formato String ou ISODate)
-    """
     try:
         limite_dt = datetime.now(timezone.utc) - timedelta(days=14)
-        # Cria uma versão em texto da data limite para apanhar os dados antigos
         limite_str = limite_dt.strftime("%Y-%m-%d") 
         
-        # O $or faz o Mongo procurar nos dois formatos!
         query = {
             "hex_id": hex_id,
             "$or": [
@@ -613,9 +676,7 @@ def listar_ocorrencias_local(hex_id: str):
         for doc in cursor:
             data_raw = doc.get("created_at")
             
-            # Formata elegantemente quer seja Texto quer seja Data
             if isinstance(data_raw, str):
-                # Se for "2026-04-12 01:30:30.312", corta para ficar só Dia e Hora
                 data_formatada = data_raw[8:10] + "/" + data_raw[5:7] + " " + data_raw[11:16]
             else:
                 data_formatada = data_raw.strftime("%d/%m %H:%M")
@@ -632,15 +693,10 @@ def listar_ocorrencias_local(hex_id: str):
 
 @app.get("/api/tatico/alerta-anomalia")
 def endpoint_alerta_anomalia():
-    """ 
-    Devolve o status atual da cidade calculado em background pelo Alimentador.
-    Resposta instantânea (O(1)) e formatada para a UI.
-    """
     db = cliente_mongo["ocorrencia_tatico"]
     
     status = db.status_sistema.find_one({"tipo_status": "sensor_anomalia"}, {"_id": 0})
     
-    # Caso o painel seja aberto antes do alimentador rodar pela primeira vez
     if not status:
         return {
             "alerta_critico": False,
@@ -651,7 +707,6 @@ def endpoint_alerta_anomalia():
             "ultima_atualizacao": "N/A"
         }
 
-    # Formatar a hora para o frontend mostrar "Última Checagem: 14:05"
     ultima_att = status["timestamp"].strftime("%H:%M")
 
     return {
