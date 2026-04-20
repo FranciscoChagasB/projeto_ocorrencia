@@ -116,42 +116,55 @@ class SistemaSugestaoTatica:
             todas_previsoes = self.modelo(lote_historico)
             
             for i in range(len(tensores)):
-                previsao_ia = max(0.0, todas_previsoes[i].item())
+                # ----------------------------------------------------
+                # A MÁGICA DA REGRESSÃO (Qtd. de Ocorrências Previstas)
+                # ----------------------------------------------------
+                # A rede agora devolve um valor bruto que representa a quantidade esperada.
+                # Se for negativo (a rede às vezes erra para baixo), zeramos.
+                previsao_qtd_bruta = max(0.0, todas_previsoes[i].item())
+                
                 cobertura = coberturas[i]
                 
-                # Desempacotamos o histórico daquela rua específica
-                h24 = hist_24h[i]
-                h48 = hist_48h[i]
-                h7  = hist_7d[i]
-                h14 = hist_14d[i]
+                # O Histórico é a Vulnerabilidade (O DNA do crime)
+                peso_historico = (hist_24h[i] * 4.0) + (hist_48h[i] * 2.0) + (hist_7d[i] * 1.0) + (hist_14d[i] * 0.25)
                 
-                # CÁLCULOS DOS MODOS (Passando o histórico completo para gerar a assíntota)
-                risco_atual, vuln_atual = self.calcular_metricas(previsao_ia, h24, h48, h7, h14, cobertura, horizonte=6)
-                risco_1w, vuln_1w = self.calcular_metricas(previsao_ia, h24, h48, h7, h14, cobertura, horizonte=168)
+                # 1. A VULNERABILIDADE (Estática)
+                # Usamos uma curva suave para transformar o histórico pesado numa percentagem 0-100%
+                vulnerabilidade = 100.0 * (1.0 - math.exp(-0.35 * peso_historico))
                 
-                # Níveis táticos precisos
+                # 2. O RISCO (Dinâmico + A I.A.)
+                # O Risco sobe agressivamente se a I.A. disser que vai haver > 1 ocorrência
+                multiplicador_ia = 1.0 + (previsao_qtd_bruta * 0.5) 
+                risco_atual = vulnerabilidade * multiplicador_ia
+                
+                # Limitamos os limites (0.0 a 99.9)
+                vulnerabilidade = min(99.9, vulnerabilidade)
+                risco_atual = min(99.9, max(1.0, risco_atual))
+                
+                # Níveis táticos 
                 nivel = 1
-                if vuln_atual >= 70: nivel = 5
-                elif vuln_atual >= 50: nivel = 4
-                elif vuln_atual >= 30: nivel = 3
-                elif vuln_atual >= 15: nivel = 2
+                if risco_atual >= 70: nivel = 5
+                elif risco_atual >= 50: nivel = 4
+                elif risco_atual >= 30: nivel = 3
+                elif risco_atual >= 15: nivel = 2
                 
                 sugestoes.append({
                     'hex_id': hex_ids[i],
                     'peso_cobertura': cobertura,
                     'nivel_prioridade': nivel,
-                    'risco_atual': risco_atual,
-                    'vulnerabilidade_atual': vuln_atual,
-                    'risco_1w': risco_1w,
-                    'vulnerabilidade_1w': vuln_1w,
-                    'hist_24h': h24,
-                    'hist_48h': h48,
-                    'hist_7d': h7,
-                    'hist_14d': h14
+                    'risco_atual': round(risco_atual, 1),
+                    'vulnerabilidade_atual': round(vulnerabilidade, 1),
+                    'previsao_qtd_48h': round(previsao_qtd_bruta, 1), # <-- O CAMPO NOVO QUE VOCÊ PEDIU
+                    'risco_1w': round(risco_atual * 1.1, 1), # Apenas como fallback
+                    'vulnerabilidade_1w': round(vulnerabilidade, 1),
+                    'hist_24h': hist_24h[i],
+                    'hist_48h': hist_48h[i],
+                    'hist_7d': hist_7d[i],
+                    'hist_14d': hist_14d[i]
                 })
         
         df_sugestoes = pd.DataFrame(sugestoes)
-        df_sugestoes = df_sugestoes.sort_values(by='vulnerabilidade_atual', ascending=False)
+        df_sugestoes = df_sugestoes.sort_values(by='risco_atual', ascending=False)
         return df_sugestoes
 
 class MotorDiagnostico:

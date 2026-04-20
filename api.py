@@ -389,10 +389,10 @@ def obter_malha_tatica(ais: list[str] = Query(default=[])):
                 "_id": "$hex_id", 
                 "peso_historico": {"$sum": "$score_risco_total"},
                 # Se a janela de tempo do crime for maior que ontem, soma o risco em hist_24h, senão soma 0
-                "hist_24h": {"$sum": {"$cond": [{"$gte": ["$janela_tempo", d24h]}, "$score_risco_total", 0]}},
-                "hist_48h": {"$sum": {"$cond": [{"$gte": ["$janela_tempo", d48h]}, "$score_risco_total", 0]}},
-                "hist_7d":  {"$sum": {"$cond": [{"$gte": ["$janela_tempo", d7d]}, "$score_risco_total", 0]}},
-                "hist_14d": {"$sum": {"$cond": [{"$gte": ["$janela_tempo", d14d]}, "$score_risco_total", 0]}}
+                "hist_24h": {"$sum": {"$cond": [{"$and": [{"$gte": ["$janela_tempo", d24h]}, {"$gt": ["$score_risco_total", 0]}]}, 1, 0]}},
+                "hist_48h": {"$sum": {"$cond": [{"$and": [{"$gte": ["$janela_tempo", d48h]}, {"$gt": ["$score_risco_total", 0]}]}, 1, 0]}},
+                "hist_7d":  {"$sum": {"$cond": [{"$and": [{"$gte": ["$janela_tempo", d7d]}, {"$gt": ["$score_risco_total", 0]}]}, 1, 0]}},
+                "hist_14d": {"$sum": {"$cond": [{"$and": [{"$gte": ["$janela_tempo", d14d]}, {"$gt": ["$score_risco_total", 0]}]}, 1, 0]}}
             }}
         ]
         
@@ -450,22 +450,21 @@ def obter_malha_tatica(ais: list[str] = Query(default=[])):
             risco = min(99.9, max(1.0, risco))
 
             malha_resposta.append({
-                "hex_id": h_id,
-                "peso_cobertura": 0.0,
+                "hex_id": row['hex_id'],
+                "peso_cobertura": row['peso_cobertura'],
+                "nivel_prioridade": row['nivel_prioridade'],
                 
-                # Nível de Prioridade alinhado com a cor do Frontend
-                "nivel_prioridade": 5 if risco > 70 else (4 if risco > 50 else (3 if risco > 30 else (2 if risco > 15 else 1))),
+                # Valores distintos baseados no novo motor de regressão
+                "vulnerabilidade_atual": row['vulnerabilidade_atual'],
+                "risco_atual": row['risco_atual'],
                 
-                "vulnerabilidade_atual": round(vulnerabilidade, 1),
-                "risco_atual": round(risco, 1),
-                "vulnerabilidade_1w": round(vulnerabilidade, 1),
-                "risco_1w": round((risco + vulnerabilidade) / 2, 1),
+                # A nova métrica: Quantidade de Crimes
+                "previsao_ocorrencias_48h": row['previsao_qtd_48h'], 
                 
-                # Histórico Bruto Real (Consultado no Banco)
-                "hist_24h": round(loc['hist_24h'], 1),
-                "hist_48h": round(loc['hist_48h'], 1),
-                "hist_7d": round(loc['hist_7d'], 1),
-                "hist_14d": round(loc['hist_14d'], 1)
+                "hist_24h": int(row['hist_24h']),
+                "hist_48h": int(row['hist_48h']),
+                "hist_7d": int(row['hist_7d']),
+                "hist_14d": int(row['hist_14d'])
             })
             
         return malha_resposta

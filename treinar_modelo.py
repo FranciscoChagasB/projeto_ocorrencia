@@ -38,8 +38,9 @@ def treinar_ia(epocas=100, batch_size=32, learning_rate=0.001):
 
     # 2. Criar o Dataset e o DataLoader
     print("2. Fatiando a linha do tempo (Janela Deslizante)...")
-    # passos_historico=4 significa que a IA olha as últimas 4 janelas (ex: 16h) para prever a próxima
-    dataset = OcorrenciasDataset(df_features, passos_historico=4, previsao_futura=1)
+    # passos_historico=7 (Olha 1 semana para trás) 
+    # previsao_futura=48 (Prevê o somatório ou a curva das próximas 48 horas)
+    dataset = OcorrenciasDataset(df_features, passos_historico=7, previsao_futura=48)
     
     if len(dataset) == 0:
         print("❌ ERRO: Dados insuficientes para criar janelas de treino. Insira mais ocorrências.")
