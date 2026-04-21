@@ -29,7 +29,11 @@ class OcorrenciasDataset(Dataset):
             # Cria o histórico contínuo (Janela Deslizante)
             for i in range(len(valores) - passos_historico - previsao_futura + 1):
                 janela_x = valores[i : i + passos_historico]
-                alvo_y = valores[i + passos_historico : i + passos_historico + previsao_futura, 0] 
+                
+                # Pegamos o vetor com as 48 horas futuras e SOMAMOS (np.sum)
+                total_crimes_futuros = np.sum(valores[i + passos_historico : i + passos_historico + previsao_futura, 0])
+                
+                alvo_y = [total_crimes_futuros]
                 
                 self.X.append(janela_x)
                 self.y.append(alvo_y)
