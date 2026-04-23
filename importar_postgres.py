@@ -14,8 +14,7 @@ MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 NOME_BANCO = "ocorrencia_tatica"
 
 ARQUIVOS_JSON = [
-    "dados_postgres.json",
-    "dados_postgres1.json"
+    "tb_ocorrencias_202604220721.json"
 ]
 
 # ==========================================
@@ -192,7 +191,7 @@ def carregar_dados(db, registros):
 # ETAPA 4 - FEATURE ENGINEERING
 # ==========================================
 def processar_features(db, features_raw):
-    print("🧠 PROCESSANDO FEATURES")
+    print("🧠 PROCESSANDO FEATURES (Aplicando Smart Padding)")
 
     if not features_raw:
         print("❌ Sem dados para features")
@@ -200,46 +199,56 @@ def processar_features(db, features_raw):
 
     df = pd.DataFrame(features_raw)
 
-    df = df.groupby(['hex_id', 'janela_tempo'])['peso'].sum().reset_index()
-    df.rename(columns={'peso': 'score_risco_total'}, inplace=True)
+    # Agrupa as ocorrências da mesma hora/local
+    df_agrupado = df.groupby(['hex_id', 'janela_tempo'])['peso'].sum().reset_index()
+    df_agrupado.rename(columns={'peso': 'score_risco_total'}, inplace=True)
+    
+    # ---------------------------------------------------------
+    # SMART PADDING (Preenchimento Contínuo de Tempo)
+    # ---------------------------------------------------------
+    print("   ↳ Criando linha do tempo contínua para os locais ativos...")
+    min_tempo = df_agrupado['janela_tempo'].min()
+    max_tempo = df_agrupado['janela_tempo'].max()
+    
+    # Gera uma lista com TODAS as horas entre a data mais antiga e a mais nova
+    todas_horas = pd.date_range(start=min_tempo, end=max_tempo, freq='h')
+    # Pega apenas os hexágonos que tiveram algum crime
+    hex_ativos = df_agrupado['hex_id'].unique()
+    
+    # Cria uma matriz gigante com TODAS as horas para TODOS os hex_ativos
+    index_completo = pd.MultiIndex.from_product([hex_ativos, todas_horas], names=['hex_id', 'janela_tempo'])
+    
+    # Faz o merge da matriz gigante com os nossos crimes. Onde não houve crime, preenche com 0.0
+    df_agrupado = df_agrupado.set_index(['hex_id', 'janela_tempo']).reindex(index_completo).fillna({'score_risco_total': 0.0}).reset_index()
+    # ---------------------------------------------------------
 
-    df['hora'] = df['janela_tempo'].dt.hour
-    df['dia'] = df['janela_tempo'].dt.weekday
+    # Engenharias de Features Temporais
+    df_agrupado['hora'] = df_agrupado['janela_tempo'].dt.hour
+    df_agrupado['dia'] = df_agrupado['janela_tempo'].dt.weekday
 
-    df['hora_sin'] = np.sin(2 * np.pi * df['hora'] / 24)
-    df['hora_cos'] = np.cos(2 * np.pi * df['hora'] / 24)
-    df['dia_sin'] = np.sin(2 * np.pi * df['dia'] / 7)
-    df['dia_cos'] = np.cos(2 * np.pi * df['dia'] / 7)
-    df['peso_cobertura'] = 1.0
+    df_agrupado['hora_sin'] = np.sin(2 * np.pi * df_agrupado['hora'] / 24)
+    df_agrupado['hora_cos'] = np.cos(2 * np.pi * df_agrupado['hora'] / 24)
+    df_agrupado['dia_sin'] = np.sin(2 * np.pi * df_agrupado['dia'] / 7)
+    df_agrupado['dia_cos'] = np.cos(2 * np.pi * df_agrupado['dia'] / 7)
+    df_agrupado['peso_cobertura'] = 1.0
 
-    df = df.drop(columns=['hora', 'dia'])
+    df_agrupado = df_agrupado.drop(columns=['hora', 'dia'])
 
-    total = 0
+    # Salvar no MongoDB
+    # Como recriámos a matriz do zero para garantir consistência temporal,
+    # vamos apagar a coleção de features antiga (a brute não é afetada) e inserir em massa.
+    print("   ↳ Inserindo matriz espaço-temporal no banco...")
+    db.features_historicas.delete_many({})
+    
+    registos = df_agrupado.to_dict(orient='records')
+    total = len(registos)
+    
+    # Inserção em lotes (Bulk Insert) para não sobrecarregar a RAM do MongoDB
+    tamanho_lote = 50000
+    for i in range(0, total, tamanho_lote):
+        db.features_historicas.insert_many(registos[i : i + tamanho_lote])
 
-    for _, row in df.iterrows():
-        doc = row.to_dict()
-
-        db.features_historicas.update_one(
-            {
-                "hex_id": doc["hex_id"],
-                "janela_tempo": doc["janela_tempo"]
-            },
-            {
-                "$inc": {"score_risco_total": doc["score_risco_total"]},
-                "$set": {
-                    "hora_sin": doc["hora_sin"],
-                    "hora_cos": doc["hora_cos"],
-                    "dia_sin": doc["dia_sin"],
-                    "dia_cos": doc["dia_cos"],
-                    "peso_cobertura": doc["peso_cobertura"]
-                }
-            },
-            upsert=True
-        )
-
-        total += 1
-
-    print(f"✅ {total} features atualizadas")
+    print(f"✅ {total} features (crimes + horas de paz) atualizadas com sucesso!")
 
 
 # ==========================================

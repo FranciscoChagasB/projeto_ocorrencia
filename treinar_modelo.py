@@ -88,4 +88,4 @@ def treinar_ia(epocas=100, batch_size=32, learning_rate=0.001):
 
 if __name__ == "__main__":
     # Como agora os dados são reais e limpos, 200 a 500 épocas costumam ser suficientes
-    treinar_ia(epocas=1000, batch_size=64)
+    treinar_ia(epocas=10, batch_size=64)

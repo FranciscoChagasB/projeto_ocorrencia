@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 from sklearn.ensemble import RandomForestClassifier
+import math
 
 # 1. PREPARAÇÃO DOS DADOS (JANELA DESLIZANTE)
 class OcorrenciasDataset(Dataset):
@@ -86,89 +87,82 @@ class SistemaSugestaoTatica:
     def calcular_metricas(self, previsao_ia, h_24, h_48, h_7, h_14, cobertura, horizonte):
         import math
         
-        # 1. DECAIMENTO TEMPORAL (O Desempate)
-        # Dá pesos diferentes consoante a urgência do histórico. 
-        # Um crime ontem vale muito mais do que um crime na semana passada.
         peso_criminal = (h_24 * 4.0) + (h_48 * 2.0) + (h_7 * 1.0) + (h_14 * 0.25)
         impacto_historico = math.sqrt(peso_criminal) if peso_criminal > 0 else 0.0
         
-        # 2. Risco Base Puro
         risco_base = previsao_ia + impacto_historico
         
-        # 3. Fator de Projeção Futura (Curva de Potência Suave)
-        # Em vez de explodir para o infinito, a semana que vem (168h) multiplica o risco por apenas ~2.7x
         fator_tempo = math.pow(horizonte / 6.0, 0.3) if horizonte >= 6 else 1.0
         risco_projetado = risco_base * fator_tempo
         
-        # 4. A CURVA ASSINTÓTICA DE SATURAÇÃO (O Segredo)
-        # Transforma os números num Índice de 0.0 a 99.9 orgânico.
         constante_suavizacao = 0.35 
         score_risco = 100.0 * (1.0 - math.exp(-constante_suavizacao * risco_projetado))
         
-        # 5. Vulnerabilidade (Abatimento das Câmeras - até 75% max)
         fator_reducao_escudo = min(0.75, cobertura * 0.15)
         score_vuln = score_risco * (1.0 - fator_reducao_escudo)
         
         return round(score_risco, 1), round(score_vuln, 1)
 
-    def gerar_malha_universal(self, tensores, hex_ids, coberturas, hist_14d, hist_7d, hist_48h, hist_24h):
+    def gerar_malha_universal(self, tensores, hex_ids, coberturas, hist_30d, hist_7d, hist_24h):
+        import math
+        from datetime import datetime
         sugestoes = []
         if len(tensores) == 0: return pd.DataFrame()
+        
+        hora_atual = datetime.now().hour
+        modificador_relogio = (math.sin(math.pi * (hora_atual - 6) / 12) * 0.2) + 0.8 
         
         with torch.no_grad():
             lote_historico = torch.stack(tensores)
             todas_previsoes = self.modelo(lote_historico)
             
             for i in range(len(tensores)):
-                # ----------------------------------------------------
-                # A MÁGICA DA REGRESSÃO (Qtd. de Ocorrências Previstas)
-                # ----------------------------------------------------
-                # A rede agora devolve um valor bruto que representa a quantidade esperada.
-                # Se for negativo (a rede às vezes erra para baixo), zeramos.
-                previsao_qtd_bruta = max(0.0, todas_previsoes[i].item())
+                risco_residual_ia = max(0.0, todas_previsoes[i].item()) / 5.0
                 
-                cobertura = coberturas[i]
+                cota_local_48h = hist_30d[i] / 15.0 
+                qtd_crimes_esperada = cota_local_48h + risco_residual_ia
                 
-                # O Histórico é a Vulnerabilidade (O DNA do crime)
-                peso_historico = (hist_24h[i] * 4.0) + (hist_48h[i] * 2.0) + (hist_7d[i] * 1.0) + (hist_14d[i] * 0.25)
+                peso_historico = (hist_24h[i] * 4.0) + (hist_7d[i] * 1.0) + (hist_30d[i] * 0.15)
+                score_base = min(7.0, peso_historico / 2.5) 
                 
-                # 1. A VULNERABILIDADE (Estática)
-                # Usamos uma curva suave para transformar o histórico pesado numa percentagem 0-100%
-                vulnerabilidade = 100.0 * (1.0 - math.exp(-0.35 * peso_historico))
+                score_ia = min(3.0, qtd_crimes_esperada * 1.5)
+                indice_ameaca = (score_base + score_ia) * modificador_relogio
                 
-                # 2. O RISCO (Dinâmico + A I.A.)
-                # O Risco sobe agressivamente se a I.A. disser que vai haver > 1 ocorrência
-                multiplicador_ia = 1.0 + (previsao_qtd_bruta * 0.5) 
-                risco_atual = vulnerabilidade * multiplicador_ia
+                if hist_24h[i] > 0:
+                    indice_ameaca = max(indice_ameaca, 6.0)
                 
-                # Limitamos os limites (0.0 a 99.9)
-                vulnerabilidade = min(99.9, vulnerabilidade)
-                risco_atual = min(99.9, max(1.0, risco_atual))
+                indice_ameaca = min(10.0, max(0.0, indice_ameaca))
                 
-                # Níveis táticos 
                 nivel = 1
-                if risco_atual >= 70: nivel = 5
-                elif risco_atual >= 50: nivel = 4
-                elif risco_atual >= 30: nivel = 3
-                elif risco_atual >= 15: nivel = 2
+                status = "TRANQUILO"
+                if indice_ameaca >= 8.0: 
+                    nivel = 5
+                    status = "CRÍTICO (Despacho Imediato)"
+                elif indice_ameaca >= 6.0: 
+                    nivel = 4
+                    status = "ALTO RISCO"
+                elif indice_ameaca >= 4.0: 
+                    nivel = 3
+                    status = "ATENÇÃO (Patrulha Frequente)"
+                elif indice_ameaca >= 2.0: 
+                    nivel = 2
+                    status = "ALERTA MODERADO"
                 
                 sugestoes.append({
                     'hex_id': hex_ids[i],
-                    'peso_cobertura': cobertura,
+                    'peso_cobertura': coberturas[i],
                     'nivel_prioridade': nivel,
-                    'risco_atual': round(risco_atual, 1),
-                    'vulnerabilidade_atual': round(vulnerabilidade, 1),
-                    'previsao_qtd_48h': round(previsao_qtd_bruta, 1), # <-- O CAMPO NOVO QUE VOCÊ PEDIU
-                    'risco_1w': round(risco_atual * 1.1, 1), # Apenas como fallback
-                    'vulnerabilidade_1w': round(vulnerabilidade, 1),
+                    'status_alerta': status,
+                    'score_alerta': round(indice_ameaca, 1),
+                    'previsao_qtd_48h': round(qtd_crimes_esperada, 1), 
+                    'tendencia_historica': round(score_base, 1),
                     'hist_24h': hist_24h[i],
-                    'hist_48h': hist_48h[i],
                     'hist_7d': hist_7d[i],
-                    'hist_14d': hist_14d[i]
+                    'hist_30d': hist_30d[i]
                 })
         
         df_sugestoes = pd.DataFrame(sugestoes)
-        df_sugestoes = df_sugestoes.sort_values(by='risco_atual', ascending=False)
+        df_sugestoes = df_sugestoes.sort_values(by='score_alerta', ascending=False)
         return df_sugestoes
 
 class MotorDiagnostico:
